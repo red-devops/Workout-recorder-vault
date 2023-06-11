@@ -1,0 +1,196 @@
+name: "Terraform - DEV"
+on:
+  push:
+    branches:
+      - dev
+  pull_request:
+    branches:
+      - dev
+
+env:
+  ENVIRONMENT: dev
+  REGION: eu-central-1
+  TEAM: Platform-Engineering
+
+jobs:
+  terraform:
+    name: Terraform
+    runs-on: self-hosted
+    
+    strategy:
+      max-parallel: 1
+      matrix:
+        component-path: 
+          [ 
+            "100-app-infra/120-network",
+            "100-app-infra/130-cicd-agent",
+            "100-app-infra/140-vault-instance",
+            "100-app-infra/150-security-groups", 
+            "100-app-infra/160-data-base", 
+            "100-app-infra/170-instances" 
+            ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.2.8
+      
+      - name: Terraform Format
+        id: fmt
+        working-directory: ${{ matrix.component-path }}
+        run: terraform fmt -check
+        
+      - name: Terraform Init
+        id: init
+        working-directory: ${{ matrix.component-path }}
+        run: terraform init  -backend-config=../vars/backend_config.hcl
+
+      - name: Terraform Workspace
+        id: workspace
+        working-directory: ${{ matrix.component-path }}
+        run: terraform workspace select ${{ env.ENVIRONMENT }}  || terraform workspace new ${{ env.ENVIRONMENT }}
+
+      - name: Terraform Validate
+        id: validate
+        working-directory: ${{ matrix.component-path }}
+        run: terraform validate -no-color
+      
+      - name: Terraform Plan
+        id: plan
+        if: github.event_name == 'pull_request'
+        working-directory: ${{ matrix.component-path }}
+        run: |
+          terraform plan \
+          -var="team=${{ env.TEAM }}" \
+          -var="region=${{ env.REGION }}" \
+          -var-file=../vars/common.vars \
+          -var-file=./vars/all.vars \
+          -no-color
+        continue-on-error: true
+
+      - name: Comment Plan Status Success
+        uses: actions/github-script@v6
+        if: github.event_name == 'pull_request' && steps.plan.outcome == 'success'
+        env:
+          PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `### Environment\ '${{ env.ENVIRONMENT }}\'
+            #### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Terraform Initialization 🙏\`${{ steps.init.outcome }}\`
+            #### Terraform Validation 👍\`${{ steps.validate.outcome }}\`
+            #### Terraform Plan 👍\`${{ steps.plan.outcome }}\`
+            #### Working directory\ '${{ matrix.component-path }}\'
+
+            <details><summary>Show Plan</summary>
+
+            \`\`\`\n
+            ${process.env.PLAN}
+            \`\`\`
+
+            </details>
+
+            *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      - name: Comment Plan Status Failure
+        uses: actions/github-script@v6
+        if: steps.plan.outcome == 'failure'
+        env:
+          PLAN: "terraform\n${{ steps.plan.outputs.stderr }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `### Environment\ '${{ env.ENVIRONMENT }}\'
+            #### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Terraform Initialization 🙏\`${{ steps.init.outcome }}\`
+            #### Terraform Validation 👍\`${{ steps.validate.outcome }}\`
+            #### Terraform Plan 💩 \`${{ steps.plan.outcome }}\`
+            #### Working directory\ '${{ matrix.component-path }}\'
+
+            <details><summary>Show Error</summary>
+
+            \`\`\`\n
+            ${process.env.PLAN}
+            \`\`\`
+
+            </details>
+
+            *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      - name: Terraform Apply
+        id: apply
+        if: github.ref == 'refs/heads/dev' && github.event_name == 'push' 
+        working-directory: ${{ matrix.component-path }}
+        run: |
+          terraform apply \
+          -var="team=${{ env.TEAM }}" \
+          -var="region=${{ env.REGION }}" \
+          -var-file=../vars/common.vars \
+          -var-file=./vars/all.vars \
+          -no-color \
+          -auto-approve
+
+      - name: Delay for 30 seconds
+        if: matrix.component-path == '100-app-infra/140-vault-instance' && 
+            github.ref == 'refs/heads/dev' && 
+            github.event_name == 'push' 
+        run: |
+          echo "Waiting 30 seconds for the vault instance to boot up properly ..."
+          sleep 30
+          echo "Done waiting."
+      
+      - name: Vault Post Provisioning - Checkout
+        if: matrix.component-path == '100-app-infra/140-vault-instance' && 
+          github.ref == 'refs/heads/dev' && 
+          github.event_name == 'push' 
+        uses: actions/checkout@v3
+        with:
+          repository: 'red-devops/Vault-server-ansible'
+          ref: 'main'
+
+      - name: Vault Post Provisioning - Pull SSH key
+        if: matrix.component-path == '100-app-infra/140-vault-instance' && 
+          github.ref == 'refs/heads/dev' && 
+          github.event_name == 'push' 
+        run: |
+          aws s3 cp \
+          s3://red-devops-workout-recorder/post-provisioning/vault_${{ env.ENVIRONMENT }}_key.pem \
+          vault_${{ env.ENVIRONMENT }}_key.pem
+          chmod 600 vault_${{ env.ENVIRONMENT }}_key.pem
+
+      - name: Vault Post Provisioning - Run Ansible Playbook
+        if: matrix.component-path == '100-app-infra/140-vault-instance' && 
+          github.ref == 'refs/heads/dev' && 
+          github.event_name == 'push'
+        run: |
+          ansible-playbook \
+          vault.yaml \
+          -i ./inventories/${{ env.ENVIRONMENT }}/inventory_aws_ec2.yaml \
+          --private-key vault_${{ env.ENVIRONMENT }}_key.pem 
+          
+      - name: Vault Post Provisioning - Remove SSH key
+        if: always() && 
+          matrix.component-path == '100-app-infra/140-vault-instance' && 
+          github.ref == 'refs/heads/dev' && 
+          github.event_name == 'push'
+        run: rm vault_${{ env.ENVIRONMENT }}_key.pem -f
+        continue-on-error: true
+   
